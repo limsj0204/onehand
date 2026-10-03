@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         한손 카페 닉네임 수집기 (onehand)
+// @name         한손 카페 닉네임 복사기 (onehand)
 // @namespace    https://github.com/limsj0204/onehand
-// @version      1.0.0
-// @description  네이버 카페 글 작성자 닉네임을 타이핑 없이 복사/수집해서 룰렛에 붙여넣기 쉽게 해 줍니다.
+// @version      1.1.0
+// @description  네이버 카페 글 작성자 닉네임을 글을 여는 즉시 클립보드에 복사해서, 타이핑 없이 룰렛에 붙여넣을 수 있게 해 줍니다.
 // @match        https://cafe.naver.com/*
 // @grant        GM_setClipboard
 // @grant        GM_getValue
@@ -30,13 +30,6 @@
   ];
   const TITLE_SELECTORS = ['.ArticleTopBox .title_text', '.ArticleTopBox h3', '.article_header .title_text'];
 
-  const DEFAULT_SETTINGS = {
-    autoCopy: true,       // 글을 열면 작성자 닉네임을 바로 클립보드에 복사
-    autoAdd: false,       // 글을 열면 수집 목록에도 자동 추가
-    allowDupNick: false,  // 같은 닉네임 여러 번 추가 허용
-    separator: 'NL',      // 전체 복사 구분자 (NL = 줄바꿈)
-  };
-
   const load = (key, def) => {
     try { return GM_getValue(key, def); } catch (e) { return def; }
   };
@@ -58,7 +51,7 @@
     return m ? m[1] : '';
   }
 
-  // ---------------------------------------------------------------- 공통: 선택 모드 (직접 클릭해서 닉네임 집기)
+  // ---------------------------------------------------------------- 공통: 직접 선택 모드 (클릭한 글자를 복사)
 
   let pickMode = load('pickMode', false);
   GM_addValueChangeListener('pickMode', (_k, _o, v) => { pickMode = v; document.documentElement.classList.toggle('onehand-picking', v); });
@@ -75,7 +68,7 @@
     e.stopPropagation();
     const t = (e.target.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40);
     if (!t) return;
-    sendToTop({ nick: t, articleId: '', title: '(직접 선택)', manual: true });
+    sendToTop({ nick: t, articleId: '', title: '(직접 선택)', picked: true });
   }, true);
 
   function sendToTop(data) {
@@ -102,13 +95,14 @@
 
   // ================================================================ 이하 최상위 창 전용: 패널 UI
 
-  const settings = Object.assign({}, DEFAULT_SETTINGS, load('settings', {}));
-  let list = load('list', []); // [{nick, articleId, title, at}]
+  // 닉네임별로 그 닉네임이 작성자였던 글 번호들. 다른 글에서 같은 닉네임이 또 나오면 알려 준다.
+  let seen = load('seen', {}); // { nick: [articleId, ...] }
   let current = null;
 
   window.addEventListener('message', (e) => {
-    if (e.origin !== location.origin || !e.data || e.data.type !== MSG_TYPE) return;
-    handleAuthor(e.data);
+    if (e.origin !== location.origin || !e.data) return;
+    if (e.data.type === MSG_TYPE) handleAuthor(e.data);
+    else if (e.data.type === 'onehand-key') recopy();
   });
 
   function copy(text) {
@@ -116,35 +110,32 @@
   }
 
   function handleAuthor(data) {
-    if (data.manual) {
-      current = data;
-      copy(data.nick);
-      addToList(data);
-      render();
-      return;
-    }
     current = data;
-    if (settings.autoCopy) {
-      copy(data.nick);
-      toast(`📋 "${data.nick}" 복사됨`);
+    copy(data.nick);
+    current.dupOf = [];
+    if (data.articleId) {
+      const ids = seen[data.nick] || [];
+      current.dupOf = ids.filter((id) => id !== data.articleId);
+      if (!ids.includes(data.articleId)) {
+        seen[data.nick] = ids.concat(data.articleId);
+        save('seen', seen);
+      }
     }
-    if (settings.autoAdd) addToList(data);
+    if (data.picked) setPickMode(false); // 한 번 집으면 자동으로 끄기
+    flash();
     render();
   }
 
-  function addToList(data) {
-    if (data.articleId && list.some((x) => x.articleId === data.articleId)) {
-      toast(`이미 추가된 글이에요: ${data.nick}`, true);
-      return false;
-    }
-    if (!settings.allowDupNick && list.some((x) => x.nick === data.nick)) {
-      toast(`이미 있는 닉네임: ${data.nick}`, true);
-      return false;
-    }
-    list.push({ nick: data.nick, articleId: data.articleId || '', title: data.title || '', at: Date.now() });
-    save('list', list);
-    toast(`✅ ${data.nick} 추가 (총 ${list.length}명)`);
-    return true;
+  function setPickMode(on) {
+    pickMode = on;
+    save('pickMode', on);
+    document.documentElement.classList.toggle('onehand-picking', on);
+  }
+
+  function recopy() {
+    if (!current) return;
+    copy(current.nick);
+    flash();
   }
 
   // ---------------------------------------------------------------- 패널 그리기
@@ -153,62 +144,36 @@
   panel.id = 'onehand-panel';
   panel.innerHTML = `
     <style>
-      #onehand-panel{position:fixed;z-index:2147483647;width:250px;font:13px/1.4 'Malgun Gothic',sans-serif;
+      #onehand-panel{position:fixed;z-index:2147483647;width:240px;font:13px/1.4 'Malgun Gothic',sans-serif;
         background:#fff;color:#222;border:2px solid #03c75a;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.25);user-select:none}
-      #onehand-panel .oh-head{display:flex;align-items:center;gap:6px;padding:6px 8px;background:#03c75a;color:#fff;
-        border-radius:9px 9px 0 0;cursor:move;font-weight:bold}
+      #onehand-panel .oh-head{display:flex;align-items:center;gap:6px;padding:5px 8px;background:#03c75a;color:#fff;
+        border-radius:9px 9px 0 0;cursor:move;font-weight:bold;font-size:12px}
       #onehand-panel .oh-head span{flex:1}
-      #onehand-panel .oh-head button{background:none;border:0;color:#fff;font-size:16px;cursor:pointer;padding:0 4px}
+      #onehand-panel .oh-head button{background:none;border:0;color:#fff;font-size:15px;cursor:pointer;padding:0 4px}
       #onehand-panel .oh-body{padding:8px}
       #onehand-panel.oh-min .oh-body{display:none}
-      #onehand-panel .oh-cur{font-size:18px;font-weight:bold;text-align:center;padding:6px;margin-bottom:6px;
-        background:#f2fbf5;border-radius:8px;word-break:break-all}
-      #onehand-panel .oh-cur small{display:block;font-size:11px;font-weight:normal;color:#777;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-      #onehand-panel .oh-btn{display:block;width:100%;margin:4px 0;padding:10px 6px;border:0;border-radius:8px;
-        font:bold 15px 'Malgun Gothic',sans-serif;cursor:pointer;background:#03c75a;color:#fff}
-      #onehand-panel .oh-btn.sub{background:#e9ecef;color:#222;font-size:13px;padding:7px 6px}
+      #onehand-panel .oh-cur{text-align:center;padding:8px 6px;border-radius:8px;background:#f2fbf5;transition:background .3s}
+      #onehand-panel .oh-cur.flash{background:#b2f2bb}
+      #onehand-panel .oh-cur .oh-label{font-size:11px;color:#2b8a3e}
+      #onehand-panel .oh-cur .oh-nick{font-size:20px;font-weight:bold;word-break:break-all}
+      #onehand-panel .oh-cur small{display:block;font-size:11px;color:#777;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      #onehand-panel .oh-dup{margin-top:6px;padding:5px;border-radius:6px;background:#fff4e6;color:#d9480f;font-size:12px;text-align:center}
+      #onehand-panel .oh-row{display:flex;gap:4px;margin-top:6px}
+      #onehand-panel .oh-btn{flex:1;padding:7px 4px;border:0;border-radius:8px;cursor:pointer;
+        font:bold 12px 'Malgun Gothic',sans-serif;background:#e9ecef;color:#222}
       #onehand-panel .oh-btn.on{background:#ff4d6d;color:#fff}
-      #onehand-panel .oh-row{display:flex;gap:4px}
-      #onehand-panel .oh-row .oh-btn{flex:1}
-      #onehand-panel ol{max-height:180px;overflow:auto;margin:6px 0;padding:0 0 0 26px;background:#fafafa;border-radius:6px}
-      #onehand-panel li{padding:2px 4px;display:flex;justify-content:space-between;gap:4px}
-      #onehand-panel li button{border:0;background:none;color:#c00;cursor:pointer;font-size:14px;line-height:1}
-      #onehand-panel label{display:block;font-size:12px;margin:2px 0;cursor:pointer}
-      #onehand-panel .oh-toast{min-height:18px;font-size:12px;text-align:center;color:#03a04a}
-      #onehand-panel .oh-toast.warn{color:#d9480f}
-      #onehand-panel details summary{cursor:pointer;font-size:12px;color:#555;margin-top:4px}
+      #onehand-panel .oh-foot{display:flex;justify-content:space-between;margin-top:6px;font-size:11px;color:#888}
+      #onehand-panel .oh-foot a{color:#888;cursor:pointer;text-decoration:underline}
     </style>
-    <div class="oh-head"><span>🖐 한손 닉네임 수집기</span><button data-act="min" title="접기/펴기">—</button></div>
+    <div class="oh-head"><span>🖐 작성자 자동 복사</span><button data-act="min" title="접기/펴기">—</button></div>
     <div class="oh-body">
-      <div class="oh-cur" data-ref="cur">글을 열어 주세요</div>
-      <button class="oh-btn" data-act="add">➕ 복사 + 목록에 추가</button>
+      <div class="oh-cur" data-ref="cur"></div>
+      <div class="oh-dup" data-ref="dup" hidden></div>
       <div class="oh-row">
-        <button class="oh-btn sub" data-act="copyCur">📋 다시 복사</button>
-        <button class="oh-btn sub" data-act="pick">🎯 직접 선택</button>
+        <button class="oh-btn" data-act="recopy">📋 다시 복사</button>
+        <button class="oh-btn" data-act="pick">🎯 직접 선택</button>
       </div>
-      <div class="oh-toast" data-ref="toast"></div>
-      <div><b>수집 목록</b> <span data-ref="count">0</span>명</div>
-      <ol data-ref="list"></ol>
-      <div class="oh-row">
-        <button class="oh-btn sub" data-act="copyAll">📋 전체 복사</button>
-        <button class="oh-btn sub" data-act="undo">↩ 마지막 취소</button>
-      </div>
-      <button class="oh-btn sub" data-act="clear">🗑 목록 비우기</button>
-      <details>
-        <summary>설정</summary>
-        <label><input type="checkbox" data-set="autoCopy"> 글 열면 작성자 자동 복사</label>
-        <label><input type="checkbox" data-set="autoAdd"> 글 열면 목록에 자동 추가</label>
-        <label><input type="checkbox" data-set="allowDupNick"> 같은 닉네임 중복 허용</label>
-        <label>전체 복사 구분자
-          <select data-set="separator">
-            <option value="NL">줄바꿈</option>
-            <option value=",">쉼표(,)</option>
-            <option value=", ">쉼표+공백</option>
-            <option value=" ">공백</option>
-          </select>
-        </label>
-        <div style="font-size:11px;color:#777;margin-top:4px">단축키: <b>\`</b>(숫자 1 왼쪽) = 복사+추가</div>
-      </details>
+      <div class="oh-foot"><span>\` 키 = 다시 복사</span><a data-act="reset">중복 기록 초기화</a></div>
     </div>`;
   document.body.appendChild(panel);
 
@@ -238,55 +203,21 @@
     document.addEventListener('mouseup', up);
   });
 
-  // 설정 UI
-  panel.querySelectorAll('[data-set]').forEach((el) => {
-    const k = el.dataset.set;
-    if (el.type === 'checkbox') el.checked = !!settings[k];
-    else el.value = settings[k];
-    el.addEventListener('change', () => {
-      settings[k] = el.type === 'checkbox' ? el.checked : el.value;
-      save('settings', settings);
-    });
-  });
-
   const actions = {
     min() {
       panel.classList.toggle('oh-min');
       save('minimized', panel.classList.contains('oh-min'));
     },
-    add() {
-      if (!current) return toast('먼저 글을 열어 주세요', true);
-      copy(current.nick);
-      addToList(current);
-      render();
-    },
-    copyCur() {
-      if (!current) return toast('먼저 글을 열어 주세요', true);
-      copy(current.nick);
-      toast(`📋 "${current.nick}" 복사됨`);
-    },
+    recopy,
     pick() {
-      save('pickMode', !pickMode);
-      pickMode = !pickMode;
-      document.documentElement.classList.toggle('onehand-picking', pickMode);
+      setPickMode(!pickMode);
       render();
-      if (pickMode) toast('닉네임을 클릭하면 바로 추가돼요');
     },
-    copyAll() {
-      if (!list.length) return toast('목록이 비어 있어요', true);
-      copy(list.map((x) => x.nick).join(settings.separator === 'NL' ? '\n' : settings.separator));
-      toast(`📋 ${list.length}명 전체 복사됨`);
-    },
-    undo() {
-      const x = list.pop();
-      save('list', list);
-      render();
-      if (x) toast(`↩ ${x.nick} 취소`);
-    },
-    clear() {
-      if (!list.length || !confirm(`수집한 ${list.length}명을 모두 지울까요?`)) return;
-      list = [];
-      save('list', list);
+    reset() {
+      if (!confirm('중복 닉네임 기록을 지울까요? (새 이벤트를 시작할 때)')) return;
+      seen = {};
+      save('seen', seen);
+      if (current) current.dupOf = [];
       render();
     },
   };
@@ -294,53 +225,39 @@
   panel.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-act]');
     if (btn && actions[btn.dataset.act]) actions[btn.dataset.act]();
-    const del = e.target.closest('[data-del]');
-    if (del) {
-      list.splice(+del.dataset.del, 1);
-      save('list', list);
-      render();
-    }
   });
 
-  // 다른 탭에서 수집한 것도 반영
-  GM_addValueChangeListener('list', (_k, _o, v, remote) => { if (remote) { list = v; render(); } });
+  // 다른 탭에서 본 글도 중복 기록에 반영
+  GM_addValueChangeListener('seen', (_k, _o, v, remote) => { if (remote) seen = v; });
 
-  // 단축키: ` (Backquote) — 입력창에 글 쓰는 중에는 무시
-  function onKey(e) {
+  // 단축키: ` (Backquote) = 다시 복사. 입력창에 글 쓰는 중에는 무시
+  document.addEventListener('keydown', (e) => {
     if (e.code !== 'Backquote' || e.ctrlKey || e.altKey || e.metaKey) return;
     const t = e.target;
     if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
     e.preventDefault();
-    actions.add();
-  }
-  document.addEventListener('keydown', onKey, true);
-  // 글 본문 iframe에 포커스가 있을 때도 단축키가 먹도록
-  window.addEventListener('message', (e) => {
-    if (e.origin === location.origin && e.data && e.data.type === 'onehand-key') actions.add();
-  });
+    recopy();
+  }, true);
 
-  let toastTimer;
-  function toast(msg, warn) {
-    const el = ref('toast');
-    el.textContent = msg;
-    el.classList.toggle('warn', !!warn);
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => { el.textContent = ''; }, 2500);
+  let flashTimer;
+  function flash() {
+    const el = ref('cur');
+    el.classList.add('flash');
+    clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => el.classList.remove('flash'), 400);
   }
 
   function esc(s) {
-    return s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   }
 
   function render() {
     ref('cur').innerHTML = current
-      ? `${esc(current.nick)}${current.title ? `<small>${esc(current.title)}</small>` : ''}`
-      : '글을 열어 주세요';
-    ref('count').textContent = list.length;
-    ref('list').innerHTML = list
-      .map((x, i) => `<li title="${esc(x.title)}"><span>${esc(x.nick)}</span><button data-del="${i}" title="삭제">✕</button></li>`)
-      .join('');
-    ref('list').scrollTop = ref('list').scrollHeight;
+      ? `<div class="oh-label">✅ 복사됨 — 룰렛에 붙여넣기만 하세요</div><div class="oh-nick">${esc(current.nick)}</div>${current.title ? `<small>${esc(current.title)}</small>` : ''}`
+      : '<div class="oh-label">카페 글을 열면 작성자가 자동으로 복사돼요</div>';
+    const dup = current && current.dupOf && current.dupOf.length;
+    ref('dup').hidden = !dup;
+    if (dup) ref('dup').textContent = `⚠ 앞에서 본 다른 글(${current.dupOf.length}개)에도 있던 닉네임이에요`;
     $('[data-act="pick"]').classList.toggle('on', pickMode);
     $('[data-act="pick"]').textContent = pickMode ? '🎯 선택 중(끄기)' : '🎯 직접 선택';
   }
